@@ -1,6 +1,16 @@
 [workspace]
 resolver = "2"
-members = ["ddk", "dlc", "dlc-messages", "dlc-trie", "payouts", "ddk-node", "ddk-manager", "kormir"]
+members = [
+    "ddk",
+    "dlc",
+    "dlc-messages",
+    "dlc-trie",
+    "payouts",
+    "ddk-node",
+    "ddk-manager",
+    "kormir",
+    "kormir-wasm",
+]
 
 [workspace.package]
 version = "1.1.0"

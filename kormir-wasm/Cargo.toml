@@ -1,0 +1,36 @@
+[package]
+name = "kormir-wasm"
+version = "1.1.0"
+edition.workspace = true
+authors = ["benthecarman <ben@mutinywallet.com>", "benny b <ben@bitcoinbay.foundation>"]
+description = "DLC oracle WASM bindings for kormir"
+license.workspace = true
+documentation = "https://docs.rs/kormir"
+homepage.workspace = true
+repository.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+kormir = { workspace = true, features = ["nostr"] }
+ddk-messages = { workspace = true, features = ["std", "use-serde"] }
+lightning = { workspace = true, features = ["std"] }
+secp256k1-zkp = { workspace = true }
+base64 = "0.22.1"
+getrandom = { version = "0.2", features = ["js"] }
+gloo-utils = "0.2.0"
+hex = { workspace = true }
+log = { workspace = true }
+nostr = { version = "0.44.0" }
+nostr-sdk = { version = "0.44.0" }
+rexie = "0.5.0"
+serde = { workspace = true, features = ["std", "derive"] }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+wasm-bindgen = "0.2.95"
+wasm-bindgen-futures = "0.4.45"
+wasm-logger = "0.2.0"
+
+[dev-dependencies]
+wasm-bindgen-test = "0.3.45"
