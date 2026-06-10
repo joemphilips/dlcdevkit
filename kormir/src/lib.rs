@@ -666,6 +666,86 @@ impl<S: Storage> Oracle<S> {
         Ok(attestation)
     }
 
+    /// Re-imports a previously-created announcement into this oracle's storage so
+    /// its outcome can be re-signed after the local nonce-index store was lost.
+    ///
+    /// Background: [`Oracle::sign_enum_event`] needs the per-event nonce *index*
+    /// that [`Storage::save_announcement`] persisted at creation time. If that
+    /// store is cleared (e.g. a fresh browser profile that only restored the
+    /// oracle signing key), the announcement can no longer be signed even though
+    /// the signed announcement itself is still available.
+    ///
+    /// Because nonce keys are derived deterministically from the signing key
+    /// (`nonce_xpriv = SHA256(signing_key)`, then hardened child `index`), the
+    /// original index can be recovered by scanning: for each committed nonce point
+    /// `R_i` in the announcement, find the index `j` such that `get_nonce_key(j)`
+    /// yields `R_i`. The recovered indexes are then persisted via
+    /// [`Storage::save_announcement`], exactly as if the announcement had just
+    /// been created — making the event signable again with no extra persisted
+    /// material beyond the announcement itself.
+    ///
+    /// This is a pure storage-rehydration primitive: it does not contact Nostr
+    /// and stores no signatures. It is idempotent for an unsigned event
+    /// (re-saving the same announcement+indexes). The announcement's
+    /// `oracle_public_key` must match this oracle's signing key, otherwise the
+    /// scan cannot succeed and [`Error::InvalidAnnouncement`] is returned.
+    ///
+    /// `max_scan` bounds the deterministic index search so a mismatched key (or
+    /// a nonce from a far-future index) fails fast instead of looping unbounded.
+    pub async fn import_announcement(
+        &self,
+        announcement: OracleAnnouncement,
+        max_scan: u32,
+    ) -> Result<String, Error> {
+        if announcement.oracle_public_key != self.public_key() {
+            return Err(Error::InvalidAnnouncement);
+        }
+        // Validate the announcement signature under this oracle's key before
+        // persisting anything derived from attacker-influenced bytes.
+        announcement
+            .validate(&self.secp)
+            .map_err(|_| Error::InvalidAnnouncement)?;
+
+        let indexes = self.recover_nonce_indexes(&announcement, max_scan)?;
+
+        let event_id = self
+            .storage
+            .save_announcement(announcement, indexes)
+            .await?;
+        Ok(event_id)
+    }
+
+    /// Recovers the nonce indexes for an announcement by deterministically
+    /// scanning derived nonce keys. See [`Oracle::import_announcement`] for the
+    /// rationale.
+    fn recover_nonce_indexes(
+        &self,
+        announcement: &OracleAnnouncement,
+        max_scan: u32,
+    ) -> Result<Vec<u32>, Error> {
+        let nonces = &announcement.oracle_event.oracle_nonces;
+        if nonces.is_empty() {
+            return Err(Error::InvalidNonces);
+        }
+
+        let mut found = Vec::with_capacity(nonces.len());
+        for nonce in nonces {
+            let mut matched: Option<u32> = None;
+            for index in 0..max_scan {
+                let candidate = self.get_nonce_key(index).x_only_public_key(&self.secp).0;
+                if candidate == *nonce {
+                    matched = Some(index);
+                    break;
+                }
+            }
+            match matched {
+                Some(index) => found.push(index),
+                None => return Err(Error::InvalidNonces),
+            }
+        }
+        Ok(found)
+    }
+
     /// Creates a numeric event announcement with fresh nonces and persists it to `storage`.
     pub async fn create_numeric_event(
         &self,
@@ -1551,6 +1631,102 @@ mod test {
         let (rx, _sig) = bytes.split_at(32);
 
         assert_eq!(rx, expected_nonce)
+    }
+
+    #[tokio::test]
+    async fn test_import_announcement_then_sign() {
+        // Simulates a fresh-profile recovery: an oracle creates an enum event,
+        // then a NEW oracle backed by the SAME signing key but an EMPTY storage
+        // imports the announcement and signs it. The recovered signature must use
+        // the announcement's committed nonce (byte-for-byte equal to the original).
+        let mut seed: [u8; 64] = [0; 64];
+        thread_rng().fill(&mut seed);
+        let xpriv = Xpriv::new_master(Network::Regtest, &seed).unwrap();
+        let signing_key = derive_signing_key(&Secp256k1::new(), xpriv).unwrap();
+
+        let original = Oracle::from_signing_key(MemoryStorage::default(), signing_key).unwrap();
+        let event_id = "enum_recover".to_string();
+        let outcomes = vec!["a".to_string(), "b".to_string()];
+        let ann = original
+            .create_enum_event(event_id.clone(), outcomes, 12345)
+            .await
+            .unwrap();
+
+        // Fresh profile: same key, empty storage (nonce index is gone).
+        let restored = Oracle::from_signing_key(MemoryStorage::default(), signing_key).unwrap();
+        // Without the import, the event is unknown and cannot be signed.
+        assert!(matches!(
+            restored
+                .sign_enum_event(event_id.clone(), "a".to_string())
+                .await,
+            Err(Error::NotFound)
+        ));
+
+        // Re-import the announcement (the only persisted material is its hex).
+        let imported_id = restored
+            .import_announcement(ann.clone(), 256)
+            .await
+            .unwrap();
+        assert_eq!(imported_id, event_id);
+
+        // Now signing succeeds and the committed nonce matches the announcement.
+        let attestation = restored
+            .sign_enum_event(event_id.clone(), "a".to_string())
+            .await
+            .unwrap();
+        assert_eq!(attestation.signatures.len(), 1);
+        let sig_bytes = attestation.signatures[0].encode();
+        assert_eq!(
+            sig_bytes[..32],
+            ann.oracle_event.oracle_nonces[0].serialize()
+        );
+
+        // And the attestation verifies against the announcement.
+        let secp = Secp256k1::new();
+        attestation.validate(&secp, &ann).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_import_announcement_wrong_key_rejected() {
+        // An announcement created by a different oracle key cannot be imported.
+        let producer = setup_test_oracle();
+        let ann = producer
+            .create_enum_event("x".to_string(), vec!["a".to_string()], 1)
+            .await
+            .unwrap();
+
+        let other = setup_test_oracle();
+        assert!(matches!(
+            other.import_announcement(ann, 256).await,
+            Err(Error::InvalidAnnouncement)
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_import_announcement_index_out_of_scan_range() {
+        // If the committed nonce lives beyond `max_scan`, recovery fails fast
+        // rather than looping unbounded.
+        let mut seed: [u8; 64] = [0; 64];
+        thread_rng().fill(&mut seed);
+        let xpriv = Xpriv::new_master(Network::Regtest, &seed).unwrap();
+        let signing_key = derive_signing_key(&Secp256k1::new(), xpriv).unwrap();
+        let original = Oracle::from_signing_key(MemoryStorage::default(), signing_key).unwrap();
+
+        // Burn several nonce indexes so the next event uses a higher index.
+        let _ = original.storage.get_next_nonce_indexes(5).await.unwrap();
+        let ann = original
+            .create_enum_event("y".to_string(), vec!["a".to_string()], 1)
+            .await
+            .unwrap();
+
+        let restored = Oracle::from_signing_key(MemoryStorage::default(), signing_key).unwrap();
+        // Scanning only index 0 cannot find the index-5 nonce.
+        assert!(matches!(
+            restored.import_announcement(ann.clone(), 1).await,
+            Err(Error::InvalidNonces)
+        ));
+        // A sufficient scan range recovers it.
+        assert!(restored.import_announcement(ann, 16).await.is_ok());
     }
 
     #[tokio::test]

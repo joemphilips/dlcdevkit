@@ -173,6 +173,42 @@ impl Kormir {
         Ok(hex::encode(attestation.encode()))
     }
 
+    /// Re-imports a previously-created announcement so its outcome can be
+    /// re-signed on a profile whose local event store was lost (fresh browser
+    /// profile restored from the oracle nsec alone). The announcement hex
+    /// (a public protocol artifact, mirrored client-side) carries the committed
+    /// nonce point(s); because nonce keys are derived deterministically from the
+    /// signing key, the original index is recovered by a bounded scan and the
+    /// announcement is re-saved. After this call `sign_enum_event(event_id, …)`
+    /// succeeds and produces the same committed-nonce signature the mint expects.
+    ///
+    /// `announcement_tlv_hex` is the TLV-enveloped hex returned by
+    /// `create_enum_event` (and stored by the client). Returns the event_id.
+    pub async fn import_enum_event(
+        &self,
+        announcement_tlv_hex: String,
+    ) -> Result<String, JsError> {
+        let bytes = hex::decode(announcement_tlv_hex)?;
+        let mut cursor = kormir::lightning::io::Cursor::new(&bytes);
+        let ann: OracleAnnouncement = ddk_messages::ser_impls::read_as_tlv(&mut cursor)
+            .map_err(|_| JsError::InvalidArgument)?;
+
+        let event_id = ann.oracle_event.event_id.clone();
+
+        // Non-destructive: if the event is already present in this profile's
+        // storage (e.g. created here, or already imported) leave it untouched so
+        // a re-import never clobbers a previously-saved attestation. Recovery is
+        // only needed when the local store lost the event.
+        if self.storage.get_event(event_id.clone()).await?.is_some() {
+            return Ok(event_id);
+        }
+
+        // 256 indexes is far beyond any realistic per-profile event count while
+        // still bounding the scan so a mismatched key fails fast.
+        let imported_id = self.oracle.import_announcement(ann, 256).await?;
+        Ok(imported_id)
+    }
+
     pub async fn list_events(&self) -> Result<JsValue, JsError> {
         let data = self.storage.list_events().await?;
         let events = data.into_iter().map(EventData::from).collect::<Vec<_>>();
