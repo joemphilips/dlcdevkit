@@ -193,6 +193,15 @@ impl Kormir {
         let ann: OracleAnnouncement = ddk_messages::ser_impls::read_as_tlv(&mut cursor)
             .map_err(|_| JsError::InvalidArgument)?;
 
+        // Reject non-enum announcements: this WASM entry-point is only for
+        // enum events (DLC conditional tokens on discrete outcomes). Numeric
+        // announcements use a different import path and should not be restored
+        // through this function.
+        match &ann.oracle_event.event_descriptor {
+            kormir::EventDescriptor::EnumEvent(_) => {}
+            _ => return Err(JsError::InvalidArgument),
+        }
+
         let event_id = ann.oracle_event.event_id.clone();
 
         // Non-destructive: if the event is already present in this profile's

@@ -684,11 +684,15 @@ impl<S: Storage> Oracle<S> {
     /// been created — making the event signable again with no extra persisted
     /// material beyond the announcement itself.
     ///
-    /// This is a pure storage-rehydration primitive: it does not contact Nostr
-    /// and stores no signatures. It is idempotent for an unsigned event
-    /// (re-saving the same announcement+indexes). The announcement's
-    /// `oracle_public_key` must match this oracle's signing key, otherwise the
-    /// scan cannot succeed and [`Error::InvalidAnnouncement`] is returned.
+    /// This operation is **idempotent**: if the event is already present in
+    /// storage (whether unsigned or already signed), it is returned unchanged.
+    /// Calling `import_announcement` on an event that already has signatures
+    /// stored will **not** overwrite those signatures or reset the stored data —
+    /// a blind re-save would reset a signed event's data and re-enable signing
+    /// with a used nonce, which is a double-sign vulnerability.
+    ///
+    /// The announcement's `oracle_public_key` must match this oracle's signing
+    /// key, otherwise [`Error::InvalidAnnouncement`] is returned.
     ///
     /// `max_scan` bounds the deterministic index search so a mismatched key (or
     /// a nonce from a far-future index) fails fast instead of looping unbounded.
@@ -705,6 +709,15 @@ impl<S: Storage> Oracle<S> {
         announcement
             .validate(&self.secp)
             .map_err(|_| Error::InvalidAnnouncement)?;
+
+        // Idempotency guard: if the event is already stored (unsigned or signed),
+        // return its id immediately without touching storage. A blind re-save
+        // would reset a signed event's data and re-enable signing with a used
+        // nonce — a double-sign vulnerability.
+        let event_id = announcement.oracle_event.event_id.clone();
+        if self.storage.get_event(event_id.clone()).await?.is_some() {
+            return Ok(event_id);
+        }
 
         let indexes = self.recover_nonce_indexes(&announcement, max_scan)?;
 
@@ -1684,6 +1697,62 @@ mod test {
         // And the attestation verifies against the announcement.
         let secp = Secp256k1::new();
         attestation.validate(&secp, &ann).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_import_announcement_never_clobbers_signed_event() {
+        // Regression guard: importing an announcement that is already stored and
+        // has been signed must return Ok with the same event_id and must NOT
+        // overwrite the stored signatures or allow signing again with the used nonce.
+        let mut seed: [u8; 64] = [0; 64];
+        thread_rng().fill(&mut seed);
+        let xpriv = Xpriv::new_master(Network::Regtest, &seed).unwrap();
+        let signing_key = derive_signing_key(&Secp256k1::new(), xpriv).unwrap();
+        let oracle = Oracle::from_signing_key(MemoryStorage::default(), signing_key).unwrap();
+
+        let event_id = "no_clobber".to_string();
+        let ann = oracle
+            .create_enum_event(
+                event_id.clone(),
+                vec!["x".to_string(), "y".to_string()],
+                99999,
+            )
+            .await
+            .unwrap();
+
+        // Sign the event — storage now has non-empty signatures.
+        oracle
+            .sign_enum_event(event_id.clone(), "x".to_string())
+            .await
+            .unwrap();
+
+        // Re-importing the same announcement must succeed idempotently.
+        let returned_id = oracle
+            .import_announcement(ann.clone(), 256)
+            .await
+            .unwrap();
+        assert_eq!(returned_id, event_id);
+
+        // The stored event must still carry non-empty signatures (not clobbered).
+        let stored = oracle
+            .storage
+            .get_event(event_id.clone())
+            .await
+            .unwrap()
+            .expect("event must still be present");
+        assert!(
+            !stored.signatures.is_empty(),
+            "import_announcement must not clobber stored signatures"
+        );
+
+        // Attempting to sign again must still fail with EventAlreadySigned.
+        let result = oracle
+            .sign_enum_event(event_id.clone(), "y".to_string())
+            .await;
+        assert!(
+            matches!(result, Err(Error::EventAlreadySigned)),
+            "signing after clobber-guarded import must still fail with EventAlreadySigned"
+        );
     }
 
     #[tokio::test]
