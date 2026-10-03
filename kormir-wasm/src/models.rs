@@ -6,6 +6,26 @@ use wasm_bindgen::prelude::wasm_bindgen;
 use wasm_bindgen::JsValue;
 
 #[wasm_bindgen]
+#[derive(Debug, Clone)]
+pub struct PreparedOracleEvent {
+    pub(crate) artifact_hex: String,
+    pub(crate) nostr_event_json: String,
+}
+
+#[wasm_bindgen]
+impl PreparedOracleEvent {
+    #[wasm_bindgen(getter)]
+    pub fn artifact_hex(&self) -> String {
+        self.artifact_hex.clone()
+    }
+
+    #[wasm_bindgen(getter)]
+    pub fn nostr_event_json(&self) -> String {
+        self.nostr_event_json.clone()
+    }
+}
+
+#[wasm_bindgen]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Announcement {
     announcement_signature: String,
