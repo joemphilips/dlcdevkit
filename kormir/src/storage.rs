@@ -7,6 +7,16 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, RwLock};
 
 pub trait Storage {
+    /// Atomically compare and replace one complete private event record.
+    async fn compare_exchange_event(
+        &self,
+        expected: Option<OracleEventData>,
+        next: OracleEventData,
+    ) -> Result<bool, Error> {
+        let _ = (expected, next);
+        Err(Error::StorageFailure)
+    }
+
     /// Get the next `num` nonce indexes
     async fn get_next_nonce_indexes(&self, num: usize) -> Result<Vec<u32>, Error>;
 
@@ -35,11 +45,54 @@ pub struct OracleEventData {
     pub event_id: String,
     pub announcement: OracleAnnouncement,
     pub indexes: Vec<u32>,
+    #[serde(default)]
+    pub private_authority: EnumPrivateAuthority,
     pub signatures: Vec<(String, Signature)>,
     #[cfg(feature = "nostr")]
     pub announcement_event_id: Option<String>,
     #[cfg(feature = "nostr")]
     pub attestation_event_id: Option<String>,
+}
+
+/// Legacy records retain their indexes. Imported terminal records cannot sign.
+#[derive(Clone, Default, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum EnumNonceAuthority {
+    #[default]
+    Legacy,
+    Explicit {
+        scalar: String,
+    },
+    Terminal,
+}
+impl std::fmt::Debug for EnumNonceAuthority {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Legacy => "Legacy",
+            Self::Explicit { .. } => "Explicit([REDACTED])",
+            Self::Terminal => "Terminal",
+        })
+    }
+}
+
+#[derive(Clone, Default, Serialize, Deserialize)]
+pub struct EnumPrivateAuthority {
+    pub nonce: EnumNonceAuthority,
+    pub choice: Option<String>,
+    pub announcement_event_json: Option<String>,
+    pub attestation_event_json: Option<String>,
+    pub staged_publication_json: Option<String>,
+}
+impl std::fmt::Debug for EnumPrivateAuthority {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("EnumPrivateAuthority([REDACTED])")
+    }
+}
+
+/// Compare persisted values without formatting private fields on failure.
+pub fn same_event(left: &OracleEventData, right: &OracleEventData) -> Result<bool, Error> {
+    Ok(serde_json::to_vec(left).map_err(|_| Error::Internal)?
+        == serde_json::to_vec(right).map_err(|_| Error::Internal)?)
 }
 
 impl OracleEventData {
@@ -87,6 +140,22 @@ impl Default for MemoryStorage {
 }
 
 impl Storage for MemoryStorage {
+    async fn compare_exchange_event(
+        &self,
+        expected: Option<OracleEventData>,
+        next: OracleEventData,
+    ) -> Result<bool, Error> {
+        let mut data = self.data.write().map_err(|_| Error::StorageFailure)?;
+        let matches = match (data.get(&next.event_id), expected.as_ref()) {
+            (None, None) => true,
+            (Some(current), Some(expected)) => same_event(current, expected)?,
+            _ => false,
+        };
+        if matches {
+            data.insert(next.event_id.clone(), next);
+        }
+        Ok(matches)
+    }
     async fn get_next_nonce_indexes(&self, num: usize) -> Result<Vec<u32>, Error> {
         let mut current_index = self.current_index.fetch_add(num as u32, Ordering::Relaxed);
         let mut indexes = Vec::with_capacity(num);
@@ -107,6 +176,7 @@ impl Storage for MemoryStorage {
             event_id: event_id.clone(),
             announcement,
             indexes,
+            private_authority: Default::default(),
             signatures: Default::default(),
             #[cfg(feature = "nostr")]
             announcement_event_id: None,
@@ -114,8 +184,9 @@ impl Storage for MemoryStorage {
             attestation_event_id: None,
         };
 
-        let mut data = self.data.try_write().unwrap();
-        data.insert(event_id.clone(), event);
+        if !self.compare_exchange_event(None, event).await? {
+            return Err(Error::InvalidAnnouncement);
+        }
 
         Ok(event_id)
     }

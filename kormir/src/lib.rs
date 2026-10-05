@@ -3,6 +3,9 @@
 pub mod error;
 #[cfg(feature = "nostr")]
 pub mod nostr_events;
+mod private_authority;
+#[cfg(feature = "nostr")]
+pub mod private_backup;
 pub mod storage;
 
 use crate::error::Error;
@@ -636,34 +639,7 @@ impl<S: Storage> Oracle<S> {
         event_id: String,
         outcome: String,
     ) -> Result<OracleAttestation, Error> {
-        let Some(data) = self.storage.get_event(event_id.clone()).await? else {
-            return Err(Error::NotFound);
-        };
-        if !data.signatures.is_empty() {
-            return Err(Error::EventAlreadySigned);
-        }
-        if data.indexes.len() != 1 {
-            return Err(Error::Internal);
-        }
-
-        let nonce_index = data.indexes[0];
-        let nonce_key = self.get_nonce_key(nonce_index);
-
-        let attestation = sign_enum_event(
-            &self.secp,
-            &self.key_pair,
-            &data.announcement,
-            &outcome,
-            &nonce_key,
-        )?;
-
-        let sigs = vec![(outcome.clone(), attestation.signatures.clone()[0])];
-
-        self.storage
-            .save_signatures(event_id.to_string(), sigs)
-            .await?;
-
-        Ok(attestation)
+        self.sign_retained_enum(event_id, outcome).await
     }
 
     /// Re-imports a previously-created announcement into this oracle's storage so
@@ -715,7 +691,10 @@ impl<S: Storage> Oracle<S> {
         // would reset a signed event's data and re-enable signing with a used
         // nonce — a double-sign vulnerability.
         let event_id = announcement.oracle_event.event_id.clone();
-        if self.storage.get_event(event_id.clone()).await?.is_some() {
+        if let Some(existing) = self.storage.get_event(event_id.clone()).await? {
+            if existing.announcement.encode() != announcement.encode() {
+                return Err(Error::InvalidAnnouncement);
+            }
             return Ok(event_id);
         }
 
@@ -1727,10 +1706,7 @@ mod test {
             .unwrap();
 
         // Re-importing the same announcement must succeed idempotently.
-        let returned_id = oracle
-            .import_announcement(ann.clone(), 256)
-            .await
-            .unwrap();
+        let returned_id = oracle.import_announcement(ann.clone(), 256).await.unwrap();
         assert_eq!(returned_id, event_id);
 
         // The stored event must still carry non-empty signatures (not clobbered).

@@ -33,4 +33,5 @@ wasm-bindgen-futures = "0.4.45"
 wasm-logger = "0.2.0"
 
 [dev-dependencies]
+futures = { workspace = true }
 wasm-bindgen-test = "0.3.45"

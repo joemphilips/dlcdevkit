@@ -80,42 +80,6 @@ impl IndexedDb {
         Ok(js.into_serde()?)
     }
 
-    pub async fn add_announcement_event_id(
-        &self,
-        event_id: String,
-        nostr_event_id: String,
-    ) -> Result<(), JsError> {
-        let tx = self
-            .rexie
-            .transaction(&[OBJECT_STORE_NAME], TransactionMode::ReadWrite)?;
-        let store = tx.store(OBJECT_STORE_NAME)?;
-        let key = JsValue::from_serde(&get_oracle_data_key(event_id))?;
-        let js = store.get(&key).await?;
-        let mut event: OracleEventData = js.into_serde()?;
-        event.announcement_event_id = Some(nostr_event_id);
-        store.put(&JsValue::from_serde(&event)?, Some(&key)).await?;
-        tx.done().await?;
-        Ok(())
-    }
-
-    pub async fn add_attestation_event_id(
-        &self,
-        event_id: String,
-        nostr_event_id: String,
-    ) -> Result<(), JsError> {
-        let tx = self
-            .rexie
-            .transaction(&[OBJECT_STORE_NAME], TransactionMode::ReadWrite)?;
-        let store = tx.store(OBJECT_STORE_NAME)?;
-        let key = JsValue::from_serde(&get_oracle_data_key(event_id))?;
-        let js = store.get(&key).await?;
-        let mut event: OracleEventData = js.into_serde()?;
-        event.attestation_event_id = Some(nostr_event_id);
-        store.put(&JsValue::from_serde(&event)?, Some(&key)).await?;
-        tx.done().await?;
-        Ok(())
-    }
-
     pub async fn list_events(&self) -> Result<Vec<(String, OracleEventData)>, JsError> {
         let tx = self
             .rexie
@@ -139,6 +103,27 @@ impl IndexedDb {
         Ok(vec)
     }
 
+    /// Reinstalling the same key must not erase retained nonce or signing authority.
+    pub async fn restore_signing_key(secret_hex: &str) -> Result<(), JsError> {
+        let rexie = Self::build_indexed_db().await?;
+        let tx = rexie.transaction(&[OBJECT_STORE_NAME], TransactionMode::ReadWrite)?;
+        let store = tx.store(OBJECT_STORE_NAME)?;
+        let key = JsValue::from_serde(NSEC_KEY)?;
+        let existing: Option<String> = store.get(&key).await?.into_serde()?;
+        if !existing
+            .as_deref()
+            .is_some_and(|current| current.eq_ignore_ascii_case(secret_hex))
+        {
+            store.clear().await?;
+            store
+                .put(&JsValue::from_serde(secret_hex)?, Some(&key))
+                .await?;
+        }
+        tx.done().await?;
+        Ok(())
+    }
+
+    #[cfg(all(test, target_arch = "wasm32"))]
     pub async fn clear() -> Result<(), JsError> {
         let rexie = Self::build_indexed_db().await?;
         let tx = rexie.transaction(&[OBJECT_STORE_NAME], TransactionMode::ReadWrite)?;
@@ -150,6 +135,42 @@ impl IndexedDb {
 }
 
 impl Storage for IndexedDb {
+    async fn compare_exchange_event(
+        &self,
+        expected: Option<OracleEventData>,
+        next: OracleEventData,
+    ) -> Result<bool, Error> {
+        let tx = self
+            .rexie
+            .transaction(&[OBJECT_STORE_NAME], TransactionMode::ReadWrite)
+            .map_err(JsError::from)?;
+        let store = tx.store(OBJECT_STORE_NAME).map_err(JsError::from)?;
+        let key = JsValue::from_serde(&get_oracle_data_key(next.event_id.clone()))
+            .map_err(JsError::from)?;
+        let current: Option<OracleEventData> = store
+            .get(&key)
+            .await
+            .map_err(JsError::from)?
+            .into_serde()
+            .map_err(JsError::from)?;
+        let matches = match (current.as_ref(), expected.as_ref()) {
+            (None, None) => true,
+            (Some(current), Some(expected)) => kormir::storage::same_event(current, expected)?,
+            _ => false,
+        };
+        if matches {
+            store
+                .put(
+                    &JsValue::from_serde(&next).map_err(JsError::from)?,
+                    Some(&key),
+                )
+                .await
+                .map_err(JsError::from)?;
+        }
+        tx.done().await.map_err(JsError::from)?;
+        Ok(matches)
+    }
+
     async fn get_next_nonce_indexes(&self, num: usize) -> Result<Vec<u32>, Error> {
         let mut current_index = self.current_index.fetch_add(num as u32, Ordering::SeqCst);
         let mut indexes = Vec::with_capacity(num);
@@ -171,13 +192,15 @@ impl Storage for IndexedDb {
             event_id: announcement.oracle_event.event_id.clone(),
             announcement: announcement.clone(),
             indexes,
+            private_authority: Default::default(),
             signatures: Default::default(),
             announcement_event_id: None,
             attestation_event_id: None,
         };
 
-        self.save_to_indexed_db(get_oracle_data_key(event.event_id.clone()), event)
-            .await?;
+        if !self.compare_exchange_event(None, event).await? {
+            return Err(Error::InvalidAnnouncement);
+        }
         Ok(announcement.oracle_event.event_id.clone())
     }
 
@@ -194,9 +217,14 @@ impl Storage for IndexedDb {
             return Err(Error::EventAlreadySigned);
         }
 
+        let previous = event.clone();
         event.signatures = sigs;
-        self.save_to_indexed_db(get_oracle_data_key(event_id), &event)
-            .await?;
+        if !self
+            .compare_exchange_event(Some(previous), event.clone())
+            .await?
+        {
+            return Err(Error::EventAlreadySigned);
+        }
         Ok(event)
     }
 

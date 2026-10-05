@@ -56,21 +56,6 @@ fn create_attestation_event(
     )
 }
 
-trait PreparationStorage: Storage {
-    async fn retain_announcement_id(&self, event_id: String, id: String) -> Result<(), JsError>;
-    async fn retain_attestation_id(&self, event_id: String, id: String) -> Result<(), JsError>;
-}
-
-impl PreparationStorage for IndexedDb {
-    async fn retain_announcement_id(&self, event_id: String, id: String) -> Result<(), JsError> {
-        self.add_announcement_event_id(event_id, id).await
-    }
-
-    async fn retain_attestation_id(&self, event_id: String, id: String) -> Result<(), JsError> {
-        self.add_attestation_event_id(event_id, id).await
-    }
-}
-
 struct PreparedEvent {
     artifact_hex: String,
     event: Event,
@@ -85,7 +70,7 @@ impl From<PreparedEvent> for PreparedOracleEvent {
     }
 }
 
-async fn prepare_announcement<S: PreparationStorage>(
+async fn prepare_announcement<S: Storage>(
     oracle: &Oracle<S>,
     event_id: String,
     outcomes: Vec<String>,
@@ -93,17 +78,86 @@ async fn prepare_announcement<S: PreparationStorage>(
     title: &str,
     description: &str,
 ) -> Result<PreparedEvent, JsError> {
-    let ann = oracle
-        .create_enum_event(event_id.clone(), outcomes, maturity)
-        .await?;
+    let ann = match oracle.storage.get_event(event_id.clone()).await? {
+        Some(existing) => {
+            oracle.validate_enum_authority(&existing)?;
+            match &existing.announcement.oracle_event.event_descriptor {
+                kormir::EventDescriptor::EnumEvent(descriptor)
+                    if descriptor.outcomes == outcomes
+                        && existing.announcement.oracle_event.event_maturity_epoch == maturity => {}
+                _ => return Err(JsError::InvalidArgument),
+            }
+            if let Some(json) = &existing.private_authority.announcement_event_json {
+                return prepared_announcement_from_retained(
+                    oracle,
+                    &existing,
+                    json,
+                    title,
+                    description,
+                );
+            }
+            existing.announcement
+        }
+        None => {
+            let mut entropy = [0u8; 32];
+            getrandom::getrandom(&mut entropy).map_err(|_| JsError::Internal)?;
+            let nonce = SecretKey::from_slice(&entropy).map_err(|_| JsError::Internal)?;
+            oracle
+                .create_enum_event_with_nonce(event_id.clone(), outcomes, maturity, nonce)
+                .await?
+        }
+    };
     let event =
         create_announcement_event_with_metadata(&oracle.nostr_keys(), &ann, title, description)?;
-    oracle
+    let mut retained = oracle
         .storage
-        .retain_announcement_id(event_id, event.id.to_hex())
-        .await?;
+        .get_event(event_id.clone())
+        .await?
+        .ok_or(JsError::NotFound)?;
+    retained.announcement_event_id = Some(event.id.to_hex());
+    retained.private_authority.announcement_event_json = Some(event.as_json());
+    match oracle.merge_enum_authority(retained).await {
+        Ok(_) => Ok(PreparedEvent {
+            artifact_hex: encode_announcement_tlv(&ann),
+            event,
+        }),
+        Err(error) => {
+            let winner = oracle
+                .storage
+                .get_event(event_id)
+                .await?
+                .ok_or(JsError::NotFound)?;
+            let json = winner
+                .private_authority
+                .announcement_event_json
+                .as_ref()
+                .ok_or_else(|| JsError::from(error))?;
+            prepared_announcement_from_retained(oracle, &winner, json, title, description)
+        }
+    }
+}
+
+fn prepared_announcement_from_retained<S: Storage>(
+    oracle: &Oracle<S>,
+    data: &OracleEventData,
+    json: &str,
+    title: &str,
+    description: &str,
+) -> Result<PreparedEvent, JsError> {
+    verify_retained_announcement(oracle, data, &data.event_id, json)?;
+    let event = Event::from_json(json).map_err(|_| JsError::InvalidArgument)?;
+    let mut tags = vec![];
+    if !title.is_empty() {
+        tags.push(Tag::parse(["title", title]).map_err(|_| JsError::InvalidArgument)?);
+    }
+    if !description.is_empty() {
+        tags.push(Tag::parse(["description", description]).map_err(|_| JsError::InvalidArgument)?);
+    }
+    if event.tags.iter().collect::<Vec<_>>() != tags.iter().collect::<Vec<_>>() {
+        return Err(JsError::InvalidArgument);
+    }
     Ok(PreparedEvent {
-        artifact_hex: encode_announcement_tlv(&ann),
+        artifact_hex: encode_announcement_tlv(&data.announcement),
         event,
     })
 }
@@ -122,8 +176,10 @@ fn verify_retained_announcement<S: Storage>(
     event_id: &str,
     announcement_event_json: &str,
 ) -> Result<EventId, JsError> {
-    let event = Event::from_json(announcement_event_json).map_err(|_| JsError::InvalidArgument)?;
-    event.verify().map_err(|_| JsError::InvalidArgument)?;
+    let event = kormir::private_backup::validate_announcement_event_json(
+        &data.announcement,
+        announcement_event_json,
+    )?;
     if event.kind != Kind::Custom(88)
         || event.pubkey != oracle.nostr_keys().public_key()
         || BASE64
@@ -168,38 +224,110 @@ fn recover_enum_attestation(
     Ok(Some(attestation))
 }
 
-async fn prepare_attestation<S: PreparationStorage>(
+fn prepared_attestation_from_retained(
+    data: &OracleEventData,
+    outcome: &str,
+) -> Result<PreparedEvent, JsError> {
+    let attestation =
+        recover_enum_attestation(data, outcome)?.ok_or(JsError::EventAlreadySigned)?;
+    let json = data
+        .private_authority
+        .attestation_event_json
+        .as_ref()
+        .ok_or(JsError::EventAlreadySigned)?;
+    let dto = kormir::private_backup::PrivateEnumAuthority {
+        schema_version: 1,
+        announcement_tlv_hex: encode_announcement_tlv(&data.announcement),
+        announcement_event_json: data
+            .private_authority
+            .announcement_event_json
+            .clone()
+            .ok_or(JsError::InvalidArgument)?,
+        nonce_scalar_hex: None,
+        signed_outcome: Some(outcome.to_owned()),
+        attestation_hex: Some(hex::encode(attestation.encode())),
+        attestation_event_json: Some(json.clone()),
+        publication_record_json: None,
+    };
+    kormir::private_backup::validate_enum_authority(
+        &dto,
+        Some(&data.announcement.oracle_public_key.to_string()),
+    )?;
+    Ok(PreparedEvent {
+        artifact_hex: hex::encode(attestation.encode()),
+        event: Event::from_json(json).map_err(|_| JsError::InvalidArgument)?,
+    })
+}
+
+async fn prepare_attestation<S: Storage>(
     oracle: &Oracle<S>,
     event_id: String,
     outcome: String,
     announcement_event_json: String,
 ) -> Result<PreparedEvent, JsError> {
-    let data = oracle
+    let mut data = oracle
         .storage
         .get_event(event_id.clone())
         .await?
         .ok_or(JsError::NotFound)?;
     let parent = verify_retained_announcement(oracle, &data, &event_id, &announcement_event_json)?;
     let recovered = recover_enum_attestation(&data, &outcome)?;
-    if data.announcement_event_id.is_none() {
-        oracle
-            .storage
-            .retain_announcement_id(event_id.clone(), parent.to_hex())
-            .await?;
-    }
+    data.announcement_event_id = Some(parent.to_hex());
+    data.private_authority.announcement_event_json = Some(announcement_event_json.clone());
+    oracle.merge_enum_authority(data).await?;
     let attestation = match recovered {
         Some(attestation) => attestation,
-        None => oracle.sign_enum_event(event_id.clone(), outcome).await?,
+        None => match oracle
+            .sign_enum_event(event_id.clone(), outcome.clone())
+            .await
+        {
+            Ok(attestation) => attestation,
+            Err(kormir::error::Error::EventAlreadySigned) => {
+                let current = oracle
+                    .storage
+                    .get_event(event_id.clone())
+                    .await?
+                    .ok_or(JsError::NotFound)?;
+                recover_enum_attestation(&current, &outcome)?.ok_or(JsError::EventAlreadySigned)?
+            }
+            Err(error) => return Err(error.into()),
+        },
     };
-    let event = create_attestation_event(&oracle.nostr_keys(), &attestation, parent)?;
-    oracle
+    let latest = oracle
         .storage
-        .retain_attestation_id(event_id, event.id.to_hex())
-        .await?;
-    Ok(PreparedEvent {
-        artifact_hex: hex::encode(attestation.encode()),
-        event,
-    })
+        .get_event(event_id.clone())
+        .await?
+        .ok_or(JsError::NotFound)?;
+    if latest.private_authority.attestation_event_json.is_some() {
+        return prepared_attestation_from_retained(&latest, &attestation.outcomes[0]);
+    }
+    let event = create_attestation_event(&oracle.nostr_keys(), &attestation, parent)?;
+    let mut retained = oracle
+        .storage
+        .get_event(event_id.clone())
+        .await?
+        .ok_or(JsError::NotFound)?;
+    retained.announcement_event_id = Some(parent.to_hex());
+    retained.private_authority.announcement_event_json = Some(announcement_event_json);
+    retained.attestation_event_id = Some(event.id.to_hex());
+    retained.private_authority.attestation_event_json = Some(event.as_json());
+    match oracle.merge_enum_authority(retained).await {
+        Ok(_) => Ok(PreparedEvent {
+            artifact_hex: hex::encode(attestation.encode()),
+            event,
+        }),
+        Err(error) => {
+            let winner = oracle
+                .storage
+                .get_event(event_id)
+                .await?
+                .ok_or(JsError::NotFound)?;
+            if winner.private_authority.attestation_event_json.is_none() {
+                return Err(error.into());
+            }
+            prepared_attestation_from_retained(&winner, &attestation.outcomes[0])
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -246,11 +374,7 @@ impl Kormir {
 
     pub async fn restore(str: String) -> Result<(), JsError> {
         let nsec = Keys::parse(&str)?;
-        IndexedDb::clear().await?;
-        let storage = IndexedDb::new().await?;
-        storage
-            .save_to_indexed_db(NSEC_KEY, hex::encode(nsec.secret_key().secret_bytes()))
-            .await?;
+        IndexedDb::restore_signing_key(&hex::encode(nsec.secret_key().secret_bytes())).await?;
         Ok(())
     }
 
@@ -321,29 +445,20 @@ impl Kormir {
         event_id: String,
         outcome: String,
     ) -> Result<String, JsError> {
-        let event = self
+        let data = self
             .storage
             .get_event(event_id.clone())
             .await?
             .ok_or(JsError::NotFound)?;
-        let nostr_event_id = retained_announcement_id(&event)?;
-        let attestation = self
-            .oracle
-            .sign_enum_event(event_id.clone(), outcome)
-            .await?;
-
-        let event =
-            create_attestation_event(&self.oracle.nostr_keys(), &attestation, nostr_event_id)?;
-
-        self.storage
-            .add_attestation_event_id(event_id, event.id.to_hex())
-            .await?;
-
-        if let Err(err) = self.client.send_event(&event).await {
-            log::warn!("Failed to publish attestation to Nostr relays: {err}");
+        let parent = data
+            .private_authority
+            .announcement_event_json
+            .ok_or(JsError::InvalidArgument)?;
+        let prepared = prepare_attestation(&self.oracle, event_id, outcome, parent).await?;
+        if self.client.send_event(&prepared.event).await.is_err() {
+            log::warn!("Failed to publish attestation to Nostr relays");
         }
-
-        Ok(hex::encode(attestation.encode()))
+        Ok(prepared.artifact_hex)
     }
 
     /// Re-imports a previously-created announcement so its outcome can be
@@ -359,7 +474,7 @@ impl Kormir {
     /// `announcement_tlv_hex` is the TLV-enveloped hex returned by
     /// `create_enum_event` (and stored by the client). Returns the event_id.
     pub async fn import_enum_event(&self, announcement_tlv_hex: String) -> Result<String, JsError> {
-        let bytes = hex::decode(announcement_tlv_hex)?;
+        let bytes = hex::decode(&announcement_tlv_hex)?;
         let mut cursor = kormir::lightning::io::Cursor::new(&bytes);
         let ann: OracleAnnouncement = ddk_messages::ser_impls::read_as_tlv(&mut cursor)
             .map_err(|_| JsError::InvalidArgument)?;
@@ -373,20 +488,136 @@ impl Kormir {
             _ => return Err(JsError::InvalidArgument),
         }
 
-        let event_id = ann.oracle_event.event_id.clone();
-
-        // Non-destructive: if the event is already present in this profile's
-        // storage (e.g. created here, or already imported) leave it untouched so
-        // a re-import never clobbers a previously-saved attestation. Recovery is
-        // only needed when the local store lost the event.
-        if self.storage.get_event(event_id.clone()).await?.is_some() {
-            return Ok(event_id);
+        if encode_announcement_tlv(&ann) != announcement_tlv_hex {
+            return Err(JsError::InvalidArgument);
         }
-
         // 256 indexes is far beyond any realistic per-profile event count while
         // still bounding the scan so a mismatched key fails fast.
         let imported_id = self.oracle.import_announcement(ann, 256).await?;
         Ok(imported_id)
+    }
+
+    /// Side-effect-free validation. Returns public facts only.
+    pub fn validate_enum_authority(
+        private_dto_json: String,
+        expected_oracle_pubkey: Option<String>,
+    ) -> Result<String, JsError> {
+        let validated = kormir::private_backup::validate_enum_authority_json(
+            &private_dto_json,
+            expected_oracle_pubkey.as_deref(),
+        )?;
+        Ok(serde_json::to_string(&validated.summary)?)
+    }
+
+    pub async fn import_enum_authority(&self, private_dto_json: String) -> Result<String, JsError> {
+        let validated = kormir::private_backup::validate_enum_authority_json(
+            &private_dto_json,
+            Some(&self.oracle.public_key().to_string()),
+        )?;
+        Ok(self
+            .oracle
+            .merge_enum_authority(validated.data)
+            .await?
+            .event_id)
+    }
+
+    pub async fn export_enum_authority(
+        &self,
+        event_id: String,
+        announcement_event_json: String,
+        publication_record_json: Option<String>,
+    ) -> Result<String, JsError> {
+        let mut data = self
+            .storage
+            .get_event(event_id.clone())
+            .await?
+            .ok_or(JsError::NotFound)?;
+        verify_retained_announcement(&self.oracle, &data, &event_id, &announcement_event_json)?;
+        data.private_authority.announcement_event_json = Some(announcement_event_json.clone());
+        let nonce = self.oracle.export_enum_nonce(event_id).await?;
+        let mut dto = kormir::private_backup::PrivateEnumAuthority {
+            schema_version: 1,
+            announcement_tlv_hex: encode_announcement_tlv(&data.announcement),
+            announcement_event_json,
+            nonce_scalar_hex: nonce.map(|secret| hex::encode(secret.secret_bytes())),
+            signed_outcome: data
+                .private_authority
+                .choice
+                .clone()
+                .or_else(|| data.signatures.first().map(|entry| entry.0.clone())),
+            attestation_hex: data
+                .attestation()
+                .map(|attestation| hex::encode(attestation.encode())),
+            attestation_event_json: data.private_authority.attestation_event_json.clone(),
+            publication_record_json: publication_record_json
+                .or(data.private_authority.staged_publication_json.clone()),
+        };
+        if let Some(json) = &dto.publication_record_json {
+            if json.len() > kormir::private_backup::MAX_PRIVATE_AUTHORITY_BYTES {
+                return Err(JsError::InvalidArgument);
+            }
+            let record: serde_json::Value = serde_json::from_str(json)?;
+            dto.signed_outcome = Some(
+                record["chosenOutcome"]
+                    .as_str()
+                    .ok_or(JsError::InvalidArgument)?
+                    .to_owned(),
+            );
+            if !record["attestation"].is_null() {
+                dto.attestation_hex = Some(
+                    record["attestation"]["attestationHex"]
+                        .as_str()
+                        .ok_or(JsError::InvalidArgument)?
+                        .to_owned(),
+                );
+                dto.attestation_event_json = Some(
+                    record["attestation"]["eventJson"]
+                        .as_str()
+                        .ok_or(JsError::InvalidArgument)?
+                        .to_owned(),
+                );
+            }
+        }
+        let validated = kormir::private_backup::validate_enum_authority(
+            &dto,
+            Some(&self.oracle.public_key().to_string()),
+        )?;
+        let retained = self.oracle.merge_enum_authority(validated.data).await?;
+        dto.signed_outcome = retained.private_authority.choice.clone();
+        dto.attestation_hex = retained
+            .attestation()
+            .map(|attestation| hex::encode(attestation.encode()));
+        dto.attestation_event_json = retained.private_authority.attestation_event_json;
+        dto.publication_record_json = retained.private_authority.staged_publication_json;
+        kormir::private_backup::validate_enum_authority(
+            &dto,
+            Some(&self.oracle.public_key().to_string()),
+        )?;
+        Ok(serde_json::to_string(&dto)?)
+    }
+
+    pub async fn staged_enum_publication(
+        &self,
+        event_id: String,
+    ) -> Result<Option<String>, JsError> {
+        Ok(self
+            .storage
+            .get_event(event_id)
+            .await?
+            .ok_or(JsError::NotFound)?
+            .private_authority
+            .staged_publication_json)
+    }
+
+    pub async fn acknowledge_enum_publication(
+        &self,
+        event_id: String,
+        exact_publication_record_json: String,
+    ) -> Result<(), JsError> {
+        Ok(self
+            .oracle
+            .acknowledge_enum_publication(event_id, &exact_publication_record_json)
+            .await?)
     }
 
     pub async fn list_events(&self) -> Result<JsValue, JsError> {
@@ -482,33 +713,41 @@ mod tests {
         fn data(&self) -> OracleEventData {
             self.0.borrow().events["match-1"].clone()
         }
-
-        fn retain_id(
-            &self,
-            event_id: String,
-            id: String,
-            announcement: bool,
-        ) -> Result<(), JsError> {
-            let mut state = self.0.borrow_mut();
-            let failure = if announcement {
-                Failure::AnnouncementId
-            } else {
-                Failure::AttestationId
-            };
-            if state.failure == failure {
-                return Err(JsError::StorageFailure);
-            }
-            let data = state.events.get_mut(&event_id).ok_or(JsError::NotFound)?;
-            if announcement {
-                data.announcement_event_id = Some(id);
-            } else {
-                data.attestation_event_id = Some(id);
-            }
-            Ok(())
-        }
     }
 
     impl Storage for TestStorage {
+        async fn compare_exchange_event(
+            &self,
+            expected: Option<OracleEventData>,
+            next: OracleEventData,
+        ) -> Result<bool, kormir::error::Error> {
+            let mut state = self.0.borrow_mut();
+            if (expected.is_none() && state.failure == Failure::Announcement)
+                || (!next.signatures.is_empty() && state.failure == Failure::Signatures)
+                || (next.announcement_event_id.is_some()
+                    && state.failure == Failure::AnnouncementId)
+                || (next.attestation_event_id.is_some() && state.failure == Failure::AttestationId)
+            {
+                return Err(kormir::error::Error::StorageFailure);
+            }
+            let matches = match (state.events.get(&next.event_id), expected.as_ref()) {
+                (None, None) => true,
+                (Some(old), Some(expected)) => kormir::storage::same_event(old, expected)?,
+                _ => false,
+            };
+            if matches {
+                if !next.signatures.is_empty()
+                    && expected
+                        .as_ref()
+                        .is_none_or(|old| old.signatures.is_empty())
+                {
+                    state.signature_saves += 1;
+                }
+                state.events.insert(next.event_id.clone(), next);
+            }
+            Ok(matches)
+        }
+
         async fn get_next_nonce_indexes(
             &self,
             num: usize,
@@ -538,6 +777,7 @@ mod tests {
                     event_id: event_id.clone(),
                     announcement,
                     indexes,
+                    private_authority: Default::default(),
                     signatures: vec![],
                     announcement_event_id: None,
                     attestation_event_id: None,
@@ -580,20 +820,6 @@ mod tests {
         }
     }
 
-    impl PreparationStorage for TestStorage {
-        async fn retain_announcement_id(
-            &self,
-            event_id: String,
-            id: String,
-        ) -> Result<(), JsError> {
-            self.retain_id(event_id, id, true)
-        }
-
-        async fn retain_attestation_id(&self, event_id: String, id: String) -> Result<(), JsError> {
-            self.retain_id(event_id, id, false)
-        }
-    }
-
     fn ready<F: Future>(future: F) -> F::Output {
         struct NoopWake;
         impl Wake for NoopWake {
@@ -630,6 +856,32 @@ mod tests {
             "YES".into(),
             parent.as_json(),
         ))
+    }
+
+    #[test]
+    fn announcement_retry_after_private_commit_preserves_nonce_and_exact_envelope() {
+        let storage = TestStorage::default();
+        let owner = oracle(storage.clone());
+        storage.fail(Failure::AnnouncementId);
+        assert!(ready(prepare_announcement(
+            &owner,
+            "match-1".into(),
+            vec!["YES".into(), "NO".into()],
+            1_700_000_000,
+            "title",
+            "description"
+        ))
+        .is_err());
+        let before = storage.data().announcement;
+        storage.fail(Failure::None);
+        let prepared = announcement(&owner);
+        assert_eq!(before, storage.data().announcement);
+        let retry = announcement(&owner);
+        assert!(prepared.event.as_json() == retry.event.as_json());
+        assert!(matches!(
+            storage.data().private_authority.nonce,
+            kormir::storage::EnumNonceAuthority::Explicit { .. }
+        ));
     }
 
     #[test]
@@ -674,16 +926,12 @@ mod tests {
             .validate(&kormir::bitcoin::secp256k1::Secp256k1::new(), &parsed)
             .unwrap();
         assert_eq!(parsed89.outcomes, ["YES"]);
-        assert_eq!(storage.0.borrow().next_nonce, 1);
+        assert_eq!(storage.0.borrow().next_nonce, 0);
     }
 
     #[test]
     fn local_preparation_stops_on_storage_failure_before_returning_artifacts() {
-        for failure in [
-            Failure::Nonce,
-            Failure::Announcement,
-            Failure::AnnouncementId,
-        ] {
+        for failure in [Failure::Announcement, Failure::AnnouncementId] {
             let storage = TestStorage::default();
             storage.fail(failure);
             let oracle = oracle(storage.clone());
@@ -778,7 +1026,10 @@ mod tests {
         let prepared = announcement(&original);
         let storage = TestStorage::default();
         let restored = oracle(storage.clone());
-        ready(restored.import_announcement(original.storage.data().announcement, 256)).unwrap();
+        let mut imported = original.storage.data();
+        imported.announcement_event_id = None;
+        imported.private_authority.announcement_event_json = None;
+        ready(restored.merge_enum_authority(imported)).unwrap();
         assert_eq!(storage.data().announcement_event_id, None);
         let result = attestation(&restored, &prepared.event).unwrap();
         assert_eq!(
@@ -800,7 +1051,10 @@ mod tests {
         let prepared = announcement(&original);
         let storage = TestStorage::default();
         let restored = oracle(storage.clone());
-        ready(restored.import_announcement(original.storage.data().announcement, 256)).unwrap();
+        let mut imported = original.storage.data();
+        imported.announcement_event_id = None;
+        imported.private_authority.announcement_event_json = None;
+        ready(restored.merge_enum_authority(imported)).unwrap();
         storage.fail(Failure::AnnouncementId);
         assert!(matches!(
             attestation(&restored, &prepared.event),
@@ -821,7 +1075,10 @@ mod tests {
         let prepared = announcement(&original);
         let storage = TestStorage::default();
         let restored = oracle(storage.clone());
-        ready(restored.import_announcement(original.storage.data().announcement, 256)).unwrap();
+        let mut imported = original.storage.data();
+        imported.announcement_event_id = None;
+        imported.private_authority.announcement_event_json = None;
+        ready(restored.merge_enum_authority(imported)).unwrap();
         let foreign_signer = create_announcement_event_with_metadata(
             &Keys::generate(),
             &storage.data().announcement,
@@ -913,5 +1170,310 @@ mod tests {
         let mut cursor = kormir::lightning::io::Cursor::new(att_content);
         let parsed = OracleAttestation::read(&mut cursor).unwrap();
         parsed.validate(&secp, &ann).unwrap();
+    }
+}
+
+#[cfg(all(test, target_arch = "wasm32"))]
+mod indexeddb_tests {
+    use super::*;
+    use kormir::private_backup::PrivateEnumAuthority;
+    use wasm_bindgen_test::*;
+    wasm_bindgen_test_configure!(run_in_browser);
+
+    async fn reopen() -> Kormir {
+        Kormir::restore("03".repeat(32)).await.unwrap();
+        let storage = IndexedDb::new().await.unwrap();
+        let oracle =
+            Oracle::from_signing_key(storage.clone(), SecretKey::from_slice(&[3; 32]).unwrap())
+                .unwrap();
+        let client = Client::new(oracle.nostr_keys());
+        Kormir {
+            storage,
+            oracle,
+            client,
+        }
+    }
+
+    #[wasm_bindgen_test]
+    async fn private_authority_real_indexeddb_restart_race_and_exact_handoff() {
+        IndexedDb::clear().await.unwrap();
+        let first = reopen().await;
+        let prepared = first
+            .prepare_enum_event(
+                "restored-event".into(),
+                vec!["YES".into(), "NO".into()],
+                1,
+                String::new(),
+                String::new(),
+            )
+            .await
+            .unwrap();
+        let exported = first
+            .export_enum_authority("restored-event".into(), prepared.nostr_event_json(), None)
+            .await
+            .unwrap();
+        let unsigned: PrivateEnumAuthority = serde_json::from_str(&exported).unwrap();
+        let summary = kormir::private_backup::validate_enum_authority_json(&exported, None)
+            .unwrap()
+            .summary;
+        IndexedDb::clear().await.unwrap();
+        let restored = reopen().await;
+        restored
+            .import_enum_authority(exported.clone())
+            .await
+            .unwrap();
+        let restarted = reopen().await;
+        assert!(restarted
+            .storage
+            .get_event("restored-event".into())
+            .await
+            .unwrap()
+            .unwrap()
+            .indexes
+            .is_empty());
+        let (yes, no) = futures::join!(
+            restarted.prepare_enum_attestation(
+                "restored-event".into(),
+                "YES".into(),
+                prepared.nostr_event_json()
+            ),
+            restored.prepare_enum_attestation(
+                "restored-event".into(),
+                "NO".into(),
+                prepared.nostr_event_json()
+            )
+        );
+        assert_eq!(usize::from(yes.is_ok()) + usize::from(no.is_ok()), 1);
+        let exact = yes.or(no).unwrap();
+        let reloaded = reopen().await;
+        let data = reloaded
+            .storage
+            .get_event("restored-event".into())
+            .await
+            .unwrap()
+            .unwrap();
+        let outcome = data.private_authority.choice.clone().unwrap();
+        let retry = reloaded
+            .prepare_enum_attestation(
+                "restored-event".into(),
+                outcome.clone(),
+                prepared.nostr_event_json(),
+            )
+            .await
+            .unwrap();
+        assert!(retry.nostr_event_json() == exact.nostr_event_json());
+        reloaded
+            .import_enum_authority(exported.clone())
+            .await
+            .unwrap();
+        assert!(
+            reloaded
+                .storage
+                .get_event("restored-event".into())
+                .await
+                .unwrap()
+                .unwrap()
+                .private_authority
+                .choice
+                .as_ref()
+                == Some(&outcome)
+        );
+        let mut signed = unsigned;
+        signed.signed_outcome = Some(outcome.clone());
+        signed.attestation_hex = Some(exact.artifact_hex());
+        signed.attestation_event_json = Some(exact.nostr_event_json());
+        let publication = serde_json::json!({ "binding": { "oracleEventId":summary.event_id, "oraclePubkey":summary.oracle_pubkey, "outcomes":summary.outcomes, "announcementEventJson":signed.announcement_event_json }, "chosenOutcome":outcome, "attestation": { "attestationHex":signed.attestation_hex, "eventJson":signed.attestation_event_json }, "relayPublished":true }).to_string();
+        signed.publication_record_json = Some(publication.clone());
+        reloaded
+            .import_enum_authority(serde_json::to_string(&signed).unwrap())
+            .await
+            .unwrap();
+        let staged = reopen().await;
+        assert!(
+            staged
+                .staged_enum_publication("restored-event".into())
+                .await
+                .unwrap()
+                .as_deref()
+                == Some(publication.as_str())
+        );
+        assert!(staged
+            .acknowledge_enum_publication("restored-event".into(), "{}".into())
+            .await
+            .is_err());
+        staged
+            .acknowledge_enum_publication("restored-event".into(), publication.clone())
+            .await
+            .unwrap();
+        assert!(reopen()
+            .await
+            .staged_enum_publication("restored-event".into())
+            .await
+            .unwrap()
+            .is_none());
+        signed.nonce_scalar_hex = None;
+        IndexedDb::clear().await.unwrap();
+        let terminal = reopen().await;
+        terminal
+            .import_enum_authority(serde_json::to_string(&signed).unwrap())
+            .await
+            .unwrap();
+        assert!(terminal.import_enum_authority(exported).await.is_err());
+        let exact_again = terminal
+            .prepare_enum_attestation(
+                "restored-event".into(),
+                signed.signed_outcome.unwrap(),
+                prepared.nostr_event_json(),
+            )
+            .await
+            .unwrap();
+        assert!(exact_again.nostr_event_json() == exact.nostr_event_json());
+        assert!(terminal
+            .oracle
+            .export_enum_nonce("restored-event".into())
+            .await
+            .unwrap()
+            .is_none());
+        let unrelated = terminal
+            .prepare_enum_event(
+                "unrelated".into(),
+                vec!["YES".into(), "NO".into()],
+                1,
+                String::new(),
+                String::new(),
+            )
+            .await
+            .unwrap();
+        let newer = terminal
+            .export_enum_authority("unrelated".into(), unrelated.nostr_event_json(), None)
+            .await
+            .unwrap();
+        let next = kormir::private_backup::validate_enum_authority_json(&newer, None)
+            .unwrap()
+            .summary;
+        assert_ne!(summary.nonce_point, next.nonce_point);
+        let choice_event = terminal
+            .prepare_enum_event(
+                "choice-crash".into(),
+                vec!["YES".into(), "NO".into()],
+                1,
+                String::new(),
+                String::new(),
+            )
+            .await
+            .unwrap();
+        let mut chosen = terminal
+            .storage
+            .get_event("choice-crash".into())
+            .await
+            .unwrap()
+            .unwrap();
+        chosen.private_authority.choice = Some("YES".into());
+        terminal.oracle.merge_enum_authority(chosen).await.unwrap();
+        let after_choice_crash = reopen().await;
+        assert!(after_choice_crash
+            .prepare_enum_attestation(
+                "choice-crash".into(),
+                "NO".into(),
+                choice_event.nostr_event_json()
+            )
+            .await
+            .is_err());
+        assert!(after_choice_crash
+            .storage
+            .get_event("choice-crash".into())
+            .await
+            .unwrap()
+            .unwrap()
+            .signatures
+            .is_empty());
+        after_choice_crash
+            .prepare_enum_attestation(
+                "choice-crash".into(),
+                "YES".into(),
+                choice_event.nostr_event_json(),
+            )
+            .await
+            .unwrap();
+        let race_event = terminal
+            .prepare_enum_event(
+                "import-race".into(),
+                vec!["YES".into(), "NO".into()],
+                1,
+                String::new(),
+                String::new(),
+            )
+            .await
+            .unwrap();
+        let stale = terminal
+            .export_enum_authority("import-race".into(), race_event.nostr_event_json(), None)
+            .await
+            .unwrap();
+        let competitor = reopen().await;
+        let (signed_race, imported_race) = futures::join!(
+            terminal.prepare_enum_attestation(
+                "import-race".into(),
+                "YES".into(),
+                race_event.nostr_event_json()
+            ),
+            competitor.import_enum_authority(stale)
+        );
+        assert!(signed_race.is_ok());
+        assert!(imported_race.is_ok());
+        let after_race = reopen()
+            .await
+            .storage
+            .get_event("import-race".into())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(after_race.private_authority.choice.as_deref(), Some("YES"));
+        assert_eq!(after_race.signatures.len(), 1);
+        assert!(after_race
+            .private_authority
+            .attestation_event_json
+            .is_some());
+        terminal.storage.get_next_nonce_indexes(300).await.unwrap();
+        Kormir::restore("03".repeat(32)).await.unwrap();
+        let same_key_login = reopen().await;
+        assert!(
+            same_key_login
+                .storage
+                .get_event("restored-event".into())
+                .await
+                .unwrap()
+                .unwrap()
+                .private_authority
+                .attestation_event_json
+                .as_deref()
+                == Some(exact.nostr_event_json().as_str())
+        );
+        assert_eq!(
+            same_key_login
+                .storage
+                .get_next_nonce_indexes(1)
+                .await
+                .unwrap(),
+            vec![300]
+        );
+        let legacy = same_key_login
+            .oracle
+            .create_enum_event("legacy-high".into(), vec!["YES".into(), "NO".into()], 1)
+            .await
+            .unwrap();
+        let legacy88 =
+            create_announcement_event_with_metadata(&terminal.oracle.nostr_keys(), &legacy, "", "")
+                .unwrap();
+        let legacy_export = terminal
+            .export_enum_authority("legacy-high".into(), legacy88.as_json(), None)
+            .await
+            .unwrap();
+        let legacy_dto: PrivateEnumAuthority = serde_json::from_str(&legacy_export).unwrap();
+        assert!(!legacy_export.contains("indexes"));
+        let listed: serde_json::Value = terminal.list_events().await.unwrap().into_serde().unwrap();
+        assert!(!listed
+            .to_string()
+            .contains(legacy_dto.nonce_scalar_hex.as_ref().unwrap()));
+        IndexedDb::clear().await.unwrap();
     }
 }
