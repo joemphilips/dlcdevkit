@@ -19,6 +19,8 @@ pub enum JsError {
     Internal,
     #[error("Error sending nostr events")]
     Nostr,
+    #[error("Retained oracle data prevents signing key installation")]
+    SigningKeyConflict,
 }
 
 impl From<Error> for JsError {
@@ -51,7 +53,7 @@ impl From<JsError> for Error {
             JsError::NotFound => Self::NotFound,
             JsError::StorageFailure => Self::StorageFailure,
             JsError::InvalidOutcome => Self::InvalidOutcome,
-            JsError::Internal | JsError::Nostr => Self::Internal,
+            JsError::Internal | JsError::Nostr | JsError::SigningKeyConflict => Self::Internal,
         }
     }
 }

@@ -351,9 +351,7 @@ impl Kormir {
                 let mut entropy = [0u8; 32];
                 getrandom::getrandom(&mut entropy).map_err(|_| JsError::Internal)?;
                 let nsec = SecretKey::from_slice(&entropy)?;
-                storage
-                    .save_to_indexed_db(NSEC_KEY, hex::encode(nsec.secret_bytes()))
-                    .await?;
+                IndexedDb::restore_signing_key(&hex::encode(nsec.secret_bytes())).await?;
                 nsec
             }
         };
@@ -1194,8 +1192,186 @@ mod indexeddb_tests {
         }
     }
 
+    async fn test_database() -> rexie::Rexie {
+        rexie::Rexie::builder("kormir")
+            .version(1)
+            .add_object_store(rexie::ObjectStore::new("oracle"))
+            .build()
+            .await
+            .unwrap()
+    }
+
+    async fn stored_record_bytes() -> Vec<u8> {
+        let database = test_database().await;
+        let tx = database
+            .transaction(&["oracle"], rexie::TransactionMode::ReadOnly)
+            .unwrap();
+        let records = tx
+            .store("oracle")
+            .unwrap()
+            .get_all(None, None, None, None)
+            .await
+            .unwrap();
+        tx.done().await.unwrap();
+        let records: Vec<(serde_json::Value, serde_json::Value)> = records
+            .into_iter()
+            .map(|(key, value)| (key.into_serde().unwrap(), value.into_serde().unwrap()))
+            .collect();
+        serde_json::to_vec(&records).unwrap()
+    }
+
+    async fn remove_signing_key() {
+        let database = test_database().await;
+        let tx = database
+            .transaction(&["oracle"], rexie::TransactionMode::ReadWrite)
+            .unwrap();
+        tx.store("oracle")
+            .unwrap()
+            .delete(&JsValue::from_serde(NSEC_KEY).unwrap())
+            .await
+            .unwrap();
+        tx.done().await.unwrap();
+    }
+
+    fn assert_signing_key_refusal<T>(result: Result<T, JsError>) {
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("Signing key installation must refuse retained records"),
+        };
+        assert!(matches!(error, JsError::SigningKeyConflict));
+        assert!(error.to_string() == "Retained oracle data prevents signing key installation");
+    }
+
+    async fn signing_key_install_preserves_retained_authority() {
+        IndexedDb::clear().await.unwrap();
+        let owner = reopen().await;
+        owner
+            .prepare_enum_event(
+                "retained-authority".into(),
+                vec!["YES".into(), "NO".into()],
+                1,
+                String::new(),
+                String::new(),
+            )
+            .await
+            .unwrap();
+        owner.storage.get_next_nonce_indexes(7).await.unwrap();
+        owner
+            .storage
+            .save_to_indexed_db("unknown-record", serde_json::json!({"future": [1, 2]}))
+            .await
+            .unwrap();
+        let before = stored_record_bytes().await;
+        Kormir::restore("03".repeat(32)).await.unwrap();
+        assert!(stored_record_bytes().await == before);
+        assert_signing_key_refusal(Kormir::restore("04".repeat(32)).await);
+        assert!(stored_record_bytes().await == before);
+        let restarted = Kormir::new(vec![]).await.unwrap();
+        assert!(restarted.get_public_key() == owner.get_public_key());
+        assert!(stored_record_bytes().await == before);
+        let prepared = restarted
+            .prepare_enum_event(
+                "retained-authority".into(),
+                vec!["YES".into(), "NO".into()],
+                1,
+                String::new(),
+                String::new(),
+            )
+            .await
+            .unwrap();
+        restarted
+            .prepare_enum_attestation(
+                "retained-authority".into(),
+                "YES".into(),
+                prepared.nostr_event_json(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            restarted.storage.get_next_nonce_indexes(1).await.unwrap(),
+            vec![7]
+        );
+    }
+
+    async fn missing_key_install_refuses_retained_records() {
+        for key in [
+            "oracle_data/retained-authority",
+            "nonce_index",
+            "unknown-record",
+        ] {
+            IndexedDb::clear().await.unwrap();
+            let owner = reopen().await;
+            owner
+                .prepare_enum_event(
+                    "retained-authority".into(),
+                    vec!["YES".into(), "NO".into()],
+                    1,
+                    String::new(),
+                    String::new(),
+                )
+                .await
+                .unwrap();
+            let data = owner
+                .storage
+                .get_event("retained-authority".into())
+                .await
+                .unwrap()
+                .unwrap();
+            IndexedDb::clear().await.unwrap();
+            let storage = IndexedDb::new().await.unwrap();
+            match key {
+                "oracle_data/retained-authority" => {
+                    storage.save_to_indexed_db(key, data).await.unwrap()
+                }
+                "nonce_index" => storage.save_to_indexed_db(key, 7u32).await.unwrap(),
+                _ => storage
+                    .save_to_indexed_db(key, serde_json::json!({"future": [1, 2]}))
+                    .await
+                    .unwrap(),
+            }
+            let before = stored_record_bytes().await;
+            assert_signing_key_refusal(Kormir::new(vec![]).await);
+            assert!(stored_record_bytes().await == before);
+            assert_signing_key_refusal(Kormir::restore("03".repeat(32)).await);
+            assert!(stored_record_bytes().await == before);
+        }
+        IndexedDb::clear().await.unwrap();
+        let owner = reopen().await;
+        owner.storage.get_next_nonce_indexes(1).await.unwrap();
+        remove_signing_key().await;
+        let before = stored_record_bytes().await;
+        assert_signing_key_refusal(Kormir::restore("03".repeat(32)).await);
+        assert!(stored_record_bytes().await == before);
+        assert_signing_key_refusal(Kormir::new(vec![]).await);
+        assert!(stored_record_bytes().await == before);
+    }
+
+    async fn fresh_and_key_only_install_succeeds() {
+        IndexedDb::clear().await.unwrap();
+        Kormir::new(vec![]).await.unwrap();
+        Kormir::restore("04".repeat(32)).await.unwrap();
+        let replaced = Kormir::new(vec![]).await.unwrap();
+        let expected = Oracle::from_signing_key(
+            replaced.storage.clone(),
+            SecretKey::from_slice(&[4; 32]).unwrap(),
+        )
+        .unwrap();
+        assert!(replaced.get_public_key() == expected.public_key().to_string());
+        IndexedDb::clear().await.unwrap();
+        Kormir::restore("0a".repeat(32)).await.unwrap();
+        let before = stored_record_bytes().await;
+        IndexedDb::restore_signing_key(&"0A".repeat(32))
+            .await
+            .unwrap();
+        assert!(stored_record_bytes().await == before);
+        IndexedDb::clear().await.unwrap();
+    }
+
     #[wasm_bindgen_test]
     async fn private_authority_real_indexeddb_restart_race_and_exact_handoff() {
+        missing_key_install_refuses_retained_records().await;
+        signing_key_install_preserves_retained_authority().await;
+        fresh_and_key_only_install_succeeds().await;
         IndexedDb::clear().await.unwrap();
         let first = reopen().await;
         let prepared = first

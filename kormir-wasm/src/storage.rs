@@ -114,7 +114,11 @@ impl IndexedDb {
             .as_deref()
             .is_some_and(|current| current.eq_ignore_ascii_case(secret_hex))
         {
-            store.clear().await?;
+            // Keep all retained state, including records unknown to this version.
+            if store.count(None).await? > u32::from(existing.is_some()) {
+                tx.done().await?;
+                return Err(JsError::SigningKeyConflict);
+            }
             store
                 .put(&JsValue::from_serde(secret_hex)?, Some(&key))
                 .await?;
