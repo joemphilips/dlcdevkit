@@ -338,6 +338,89 @@ pub struct Kormir {
     client: Client,
 }
 
+impl Kormir {
+    async fn export_enum_authority_version(
+        &self,
+        event_id: String,
+        announcement_event_json: String,
+        publication_record_json: Option<String>,
+        authority_version: u32,
+    ) -> Result<String, JsError> {
+        let mut data = self
+            .storage
+            .get_event(event_id.clone())
+            .await?
+            .ok_or(JsError::NotFound)?;
+        verify_retained_announcement(&self.oracle, &data, &event_id, &announcement_event_json)?;
+        data.private_authority.announcement_event_json = Some(announcement_event_json.clone());
+        let nonce = self.oracle.export_enum_nonce(event_id).await?;
+        let mut dto = kormir::private_backup::PrivateEnumAuthority {
+            schema_version: 1,
+            announcement_tlv_hex: encode_announcement_tlv(&data.announcement),
+            announcement_event_json,
+            nonce_scalar_hex: nonce.map(|secret| hex::encode(secret.secret_bytes())),
+            signed_outcome: data
+                .private_authority
+                .choice
+                .clone()
+                .or_else(|| data.signatures.first().map(|entry| entry.0.clone())),
+            attestation_hex: data
+                .attestation()
+                .map(|attestation| hex::encode(attestation.encode())),
+            attestation_event_json: data.private_authority.attestation_event_json.clone(),
+            publication_record_json: publication_record_json
+                .or(data.private_authority.staged_publication_json.clone()),
+        };
+        if let Some(json) = &dto.publication_record_json {
+            if json.len() > kormir::private_backup::MAX_AUTHORITY_MODEL_BYTES {
+                return Err(JsError::InvalidArgument);
+            }
+            let record: serde_json::Value = serde_json::from_str(json)?;
+            dto.signed_outcome = Some(
+                record["chosenOutcome"]
+                    .as_str()
+                    .ok_or(JsError::InvalidArgument)?
+                    .to_owned(),
+            );
+            if !record["attestation"].is_null() {
+                dto.attestation_hex = Some(
+                    record["attestation"]["attestationHex"]
+                        .as_str()
+                        .ok_or(JsError::InvalidArgument)?
+                        .to_owned(),
+                );
+                dto.attestation_event_json = Some(
+                    record["attestation"]["eventJson"]
+                        .as_str()
+                        .ok_or(JsError::InvalidArgument)?
+                        .to_owned(),
+                );
+            }
+        }
+        let encoded = kormir::private_backup::encode_enum_authority_json(
+            &dto,
+            Some(&self.oracle.public_key().to_string()),
+            authority_version,
+        )?;
+        let validated = kormir::private_backup::validate_enum_authority_json(
+            &encoded,
+            Some(&self.oracle.public_key().to_string()),
+        )?;
+        let retained = self.oracle.merge_enum_authority(validated.data).await?;
+        dto.signed_outcome = retained.private_authority.choice.clone();
+        dto.attestation_hex = retained
+            .attestation()
+            .map(|attestation| hex::encode(attestation.encode()));
+        dto.attestation_event_json = retained.private_authority.attestation_event_json;
+        dto.publication_record_json = retained.private_authority.staged_publication_json;
+        Ok(kormir::private_backup::encode_enum_authority_json(
+            &dto,
+            Some(&self.oracle.public_key().to_string()),
+            authority_version,
+        )?)
+    }
+}
+
 #[wasm_bindgen]
 impl Kormir {
     pub async fn new(relays: Vec<String>) -> Result<Kormir, JsError> {
@@ -519,79 +602,36 @@ impl Kormir {
             .event_id)
     }
 
+    /// Compatibility release: existing callers continue to write v1.
     pub async fn export_enum_authority(
         &self,
         event_id: String,
         announcement_event_json: String,
         publication_record_json: Option<String>,
     ) -> Result<String, JsError> {
-        let mut data = self
-            .storage
-            .get_event(event_id.clone())
-            .await?
-            .ok_or(JsError::NotFound)?;
-        verify_retained_announcement(&self.oracle, &data, &event_id, &announcement_event_json)?;
-        data.private_authority.announcement_event_json = Some(announcement_event_json.clone());
-        let nonce = self.oracle.export_enum_nonce(event_id).await?;
-        let mut dto = kormir::private_backup::PrivateEnumAuthority {
-            schema_version: 1,
-            announcement_tlv_hex: encode_announcement_tlv(&data.announcement),
+        self.export_enum_authority_version(
+            event_id,
             announcement_event_json,
-            nonce_scalar_hex: nonce.map(|secret| hex::encode(secret.secret_bytes())),
-            signed_outcome: data
-                .private_authority
-                .choice
-                .clone()
-                .or_else(|| data.signatures.first().map(|entry| entry.0.clone())),
-            attestation_hex: data
-                .attestation()
-                .map(|attestation| hex::encode(attestation.encode())),
-            attestation_event_json: data.private_authority.attestation_event_json.clone(),
-            publication_record_json: publication_record_json
-                .or(data.private_authority.staged_publication_json.clone()),
-        };
-        if let Some(json) = &dto.publication_record_json {
-            if json.len() > kormir::private_backup::MAX_PRIVATE_AUTHORITY_BYTES {
-                return Err(JsError::InvalidArgument);
-            }
-            let record: serde_json::Value = serde_json::from_str(json)?;
-            dto.signed_outcome = Some(
-                record["chosenOutcome"]
-                    .as_str()
-                    .ok_or(JsError::InvalidArgument)?
-                    .to_owned(),
-            );
-            if !record["attestation"].is_null() {
-                dto.attestation_hex = Some(
-                    record["attestation"]["attestationHex"]
-                        .as_str()
-                        .ok_or(JsError::InvalidArgument)?
-                        .to_owned(),
-                );
-                dto.attestation_event_json = Some(
-                    record["attestation"]["eventJson"]
-                        .as_str()
-                        .ok_or(JsError::InvalidArgument)?
-                        .to_owned(),
-                );
-            }
-        }
-        let validated = kormir::private_backup::validate_enum_authority(
-            &dto,
-            Some(&self.oracle.public_key().to_string()),
-        )?;
-        let retained = self.oracle.merge_enum_authority(validated.data).await?;
-        dto.signed_outcome = retained.private_authority.choice.clone();
-        dto.attestation_hex = retained
-            .attestation()
-            .map(|attestation| hex::encode(attestation.encode()));
-        dto.attestation_event_json = retained.private_authority.attestation_event_json;
-        dto.publication_record_json = retained.private_authority.staged_publication_json;
-        kormir::private_backup::validate_enum_authority(
-            &dto,
-            Some(&self.oracle.public_key().to_string()),
-        )?;
-        Ok(serde_json::to_string(&dto)?)
+            publication_record_json,
+            1,
+        )
+        .await
+    }
+
+    /// Explicit compact export; activation is separate from deploying its reader.
+    pub async fn export_enum_authority_v2(
+        &self,
+        event_id: String,
+        announcement_event_json: String,
+        publication_record_json: Option<String>,
+    ) -> Result<String, JsError> {
+        self.export_enum_authority_version(
+            event_id,
+            announcement_event_json,
+            publication_record_json,
+            2,
+        )
+        .await
     }
 
     pub async fn staged_enum_publication(
@@ -1367,8 +1407,142 @@ mod indexeddb_tests {
         IndexedDb::clear().await.unwrap();
     }
 
+    async fn compact_maximum_authority_round_trips_indexeddb() {
+        use kormir::bitcoin::hashes::{sha256, Hash, HashEngine};
+        IndexedDb::clear().await.unwrap();
+        let owner = reopen().await;
+        let event_id = "compact-capacity".to_owned();
+        let outcomes: Vec<String> = (0..8).map(|n| format!("{n}{}", "x".repeat(190))).collect();
+        let prepared = owner
+            .prepare_enum_event(
+                event_id.clone(),
+                outcomes.clone(),
+                1,
+                format!("x{}", "\u{0001}".repeat(199)),
+                format!("x{}", "\u{0001}".repeat(1999)),
+            )
+            .await
+            .unwrap();
+        let unsigned = owner
+            .export_enum_authority_v2(event_id.clone(), prepared.nostr_event_json(), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&unsigned).unwrap()["schemaVersion"],
+            2
+        );
+        let attestation = owner
+            .prepare_enum_attestation(
+                event_id.clone(),
+                outcomes[0].clone(),
+                prepared.nostr_event_json(),
+            )
+            .await
+            .unwrap();
+        let key = owner.get_public_key();
+        let tag = sha256::Hash::hash(b"Cashu_condition_id");
+        let mut hash = sha256::Hash::engine();
+        hash.input(tag.as_byte_array());
+        hash.input(tag.as_byte_array());
+        hash.input(&hex::decode(&key).unwrap());
+        hash.input(event_id.as_bytes());
+        hash.input(&[8]);
+        let condition = sha256::Hash::from_engine(hash).to_string();
+        let parent = Event::from_json(prepared.nostr_event_json()).unwrap();
+        let child = Event::from_json(attestation.nostr_event_json()).unwrap();
+        let explanation =
+            EventBuilder::new(Kind::Custom(1111), format!("x{}", "\u{0001}".repeat(4095)))
+                .allow_self_tagging()
+                .tags([
+                    Tag::parse(["E", &parent.id.to_hex(), "", &key]).unwrap(),
+                    Tag::parse(["K", "88"]).unwrap(),
+                    Tag::parse(["P", &key]).unwrap(),
+                    Tag::parse(["e", &child.id.to_hex(), "", &key]).unwrap(),
+                    Tag::parse(["k", "89"]).unwrap(),
+                    Tag::parse(["p", &key]).unwrap(),
+                ])
+                .sign_with_keys(&owner.oracle.nostr_keys())
+                .unwrap()
+                .as_json();
+        let publication = serde_json::json!({
+            "binding":{"conditionId":condition,"oracleEventId":event_id,"oraclePubkey":key,"outcomes":outcomes,"announcementEventJson":prepared.nostr_event_json()},
+            "chosenOutcome":outcomes[0],"attestation":{"attestationHex":attestation.artifact_hex(),"eventJson":attestation.nostr_event_json()},
+            "relayPublished":false,"engineEvidence":null,"explanationEventJson":explanation,"explanationRelayPublished":false
+        }).to_string();
+        assert!(owner
+            .export_enum_authority(
+                event_id.clone(),
+                prepared.nostr_event_json(),
+                Some(publication.clone())
+            )
+            .await
+            .is_err());
+        let compact = owner
+            .export_enum_authority_v2(
+                event_id.clone(),
+                prepared.nostr_event_json(),
+                Some(publication.clone()),
+            )
+            .await
+            .unwrap();
+        assert!(compact.len() < kormir::private_backup::MAX_PRIVATE_AUTHORITY_BYTES);
+        let reread = reopen().await;
+        let same = reread
+            .export_enum_authority_v2(
+                event_id.clone(),
+                prepared.nostr_event_json(),
+                Some(publication),
+            )
+            .await
+            .unwrap();
+        assert_eq!(same, compact);
+        IndexedDb::clear().await.unwrap();
+        let restored = reopen().await;
+        restored
+            .import_enum_authority(compact.clone())
+            .await
+            .unwrap();
+        let retried = restored
+            .prepare_enum_attestation(
+                event_id.clone(),
+                outcomes[0].clone(),
+                prepared.nostr_event_json(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(retried.nostr_event_json(), attestation.nostr_event_json());
+        assert!(restored
+            .prepare_enum_attestation(
+                event_id.clone(),
+                outcomes[1].clone(),
+                prepared.nostr_event_json()
+            )
+            .await
+            .is_err());
+        let mut terminal: serde_json::Value = serde_json::from_str(&compact).unwrap();
+        terminal["nonceScalarHex"] = serde_json::Value::Null;
+        terminal["publication"]["relayPublished"] = serde_json::json!(true);
+        // Release the exact handoff before importing a newer terminal publication stage.
+        let staged = restored
+            .staged_enum_publication(event_id.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        restored
+            .acknowledge_enum_publication(event_id.clone(), staged)
+            .await
+            .unwrap();
+        restored
+            .import_enum_authority(terminal.to_string())
+            .await
+            .unwrap();
+        assert!(restored.import_enum_authority(unsigned).await.is_err());
+        IndexedDb::clear().await.unwrap();
+    }
+
     #[wasm_bindgen_test]
     async fn private_authority_real_indexeddb_restart_race_and_exact_handoff() {
+        compact_maximum_authority_round_trips_indexeddb().await;
         missing_key_install_refuses_retained_records().await;
         signing_key_install_preserves_retained_authority().await;
         fresh_and_key_only_install_succeeds().await;

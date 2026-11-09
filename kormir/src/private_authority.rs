@@ -138,7 +138,7 @@ impl<S: Storage> Oracle<S> {
                     &mut next.private_authority.attestation_event_json,
                     &old.private_authority.attestation_event_json,
                 )?;
-                merge_option(
+                merge_publication(
                     &mut next.private_authority.staged_publication_json,
                     &old.private_authority.staged_publication_json,
                 )?;
@@ -267,4 +267,27 @@ fn merge_option<T: Clone + PartialEq>(
         }
         _ => Ok(()),
     }
+}
+
+/// The transport codec may reconstruct object key order, but never signed event strings.
+/// Keep the retained journal bytes so its existing exact acknowledgment remains valid.
+fn merge_publication(
+    incoming: &mut Option<String>,
+    retained: &Option<String>,
+) -> Result<(), Error> {
+    if let (Some(next), Some(old)) = (incoming.as_ref(), retained.as_ref()) {
+        if next != old {
+            let next: serde_json::Value =
+                serde_json::from_str(next).map_err(|_| Error::InvalidAnnouncement)?;
+            let old: serde_json::Value =
+                serde_json::from_str(old).map_err(|_| Error::InvalidAnnouncement)?;
+            if next != old {
+                return Err(Error::EventAlreadySigned);
+            }
+        }
+    }
+    if retained.is_some() {
+        *incoming = retained.clone();
+    }
+    Ok(())
 }
