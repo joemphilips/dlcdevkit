@@ -70,6 +70,28 @@ impl From<PreparedEvent> for PreparedOracleEvent {
     }
 }
 
+/// Point-read the exact public artifact; absence never prepares or signs an event.
+async fn read_prepared_announcement<S: Storage>(
+    oracle: &Oracle<S>,
+    event_id: String,
+) -> Result<Option<PreparedOracleEvent>, JsError> {
+    if event_id.is_empty() || event_id.len() > 512 {
+        return Err(JsError::InvalidArgument);
+    }
+    let Some(data) = oracle.storage.get_event(event_id.clone()).await? else {
+        return Ok(None);
+    };
+    let Some(json) = data.private_authority.announcement_event_json.as_ref() else {
+        return Ok(None);
+    };
+    oracle.validate_enum_authority(&data)?;
+    verify_retained_announcement(oracle, &data, &event_id, json)?;
+    Ok(Some(PreparedOracleEvent {
+        artifact_hex: encode_announcement_tlv(&data.announcement),
+        nostr_event_json: json.clone(),
+    }))
+}
+
 async fn prepare_announcement<S: Storage>(
     oracle: &Oracle<S>,
     event_id: String,
@@ -463,6 +485,14 @@ impl Kormir {
         self.oracle.public_key().to_string()
     }
 
+    /// Read one retained public announcement without allocating, signing, or modifying storage.
+    pub async fn read_prepared_enum_announcement(
+        &self,
+        event_id: String,
+    ) -> Result<Option<PreparedOracleEvent>, JsError> {
+        read_prepared_announcement(&self.oracle, event_id).await
+    }
+
     pub async fn prepare_enum_event(
         &self,
         event_id: String,
@@ -737,6 +767,7 @@ mod tests {
         events: HashMap<String, OracleEventData>,
         next_nonce: u32,
         signature_saves: usize,
+        event_reads: usize,
         failure: Failure,
     }
 
@@ -850,7 +881,8 @@ mod tests {
             &self,
             event_id: String,
         ) -> Result<Option<OracleEventData>, kormir::error::Error> {
-            let state = self.0.borrow();
+            let mut state = self.0.borrow_mut();
+            state.event_reads += 1;
             if state.failure == Failure::Read {
                 return Err(kormir::error::Error::StorageFailure);
             }
@@ -894,6 +926,113 @@ mod tests {
             "YES".into(),
             parent.as_json(),
         ))
+    }
+
+    #[test]
+    fn retained_announcement_point_read_preserves_exact_legacy_and_markdown_artifacts() {
+        let storage = TestStorage::default();
+        let owner = oracle(storage.clone());
+        for (id, description) in [
+            ("legacy", "## Outcome - first - second"),
+            ("markdown", "## Outcome\n\n- first\n- second\n"),
+        ] {
+            let prepared = ready(prepare_announcement(
+                &owner,
+                id.into(),
+                vec!["YES".into(), "NO".into()],
+                1,
+                "Title",
+                description,
+            ))
+            .unwrap();
+            let exact = format!(" {}\n", prepared.event.as_json());
+            storage
+                .0
+                .borrow_mut()
+                .events
+                .get_mut(id)
+                .unwrap()
+                .private_authority
+                .announcement_event_json = Some(exact.clone());
+            let before = serde_json::to_vec(&storage.0.borrow().events).unwrap();
+            let before_reads = storage.0.borrow().event_reads;
+            let before_nonce = storage.0.borrow().next_nonce;
+            let before_signatures = storage.0.borrow().signature_saves;
+            storage.fail(Failure::AnnouncementId);
+            let retained = ready(read_prepared_announcement(&owner, id.into()))
+                .unwrap()
+                .unwrap();
+            assert_eq!(retained.nostr_event_json(), exact);
+            assert_eq!(retained.artifact_hex(), prepared.artifact_hex);
+            let event = Event::from_json(retained.nostr_event_json()).unwrap();
+            assert!(event
+                .tags
+                .iter()
+                .any(|tag| tag.as_slice() == ["description", description]));
+            assert_eq!(storage.0.borrow().event_reads, before_reads + 1);
+            assert_eq!(storage.0.borrow().next_nonce, before_nonce);
+            assert_eq!(storage.0.borrow().signature_saves, before_signatures);
+            assert!(serde_json::to_vec(&storage.0.borrow().events).unwrap() == before);
+            storage.fail(Failure::None);
+        }
+    }
+
+    #[test]
+    fn retained_announcement_point_read_bounds_ids_and_never_repairs_missing_or_invalid_state() {
+        let storage = TestStorage::default();
+        let owner = oracle(storage.clone());
+        for id in [String::new(), "a".repeat(513), "界".repeat(171)] {
+            assert!(ready(read_prepared_announcement(&owner, id)).is_err());
+        }
+        assert_eq!(storage.0.borrow().event_reads, 0);
+        assert!(ready(read_prepared_announcement(&owner, "a".repeat(512)))
+            .unwrap()
+            .is_none());
+        assert!(storage.0.borrow().events.is_empty());
+        let prepared = announcement(&owner);
+        storage
+            .0
+            .borrow_mut()
+            .events
+            .get_mut("match-1")
+            .unwrap()
+            .private_authority
+            .announcement_event_json = None;
+        let missing = serde_json::to_vec(&storage.0.borrow().events).unwrap();
+        assert!(ready(read_prepared_announcement(&owner, "match-1".into()))
+            .unwrap()
+            .is_none());
+        assert!(serde_json::to_vec(&storage.0.borrow().events).unwrap() == missing);
+        let other = ready(prepare_announcement(
+            &owner,
+            "other".into(),
+            vec!["YES".into(), "NO".into()],
+            1,
+            "",
+            "",
+        ))
+        .unwrap();
+        storage
+            .0
+            .borrow_mut()
+            .events
+            .get_mut("match-1")
+            .unwrap()
+            .private_authority
+            .announcement_event_json = Some(other.event.as_json());
+        let foreign = serde_json::to_vec(&storage.0.borrow().events).unwrap();
+        assert!(ready(read_prepared_announcement(&owner, "match-1".into())).is_err());
+        assert!(serde_json::to_vec(&storage.0.borrow().events).unwrap() == foreign);
+        storage
+            .0
+            .borrow_mut()
+            .events
+            .get_mut("match-1")
+            .unwrap()
+            .private_authority
+            .announcement_event_json = Some(prepared.event.as_json());
+        storage.fail(Failure::Read);
+        assert!(ready(read_prepared_announcement(&owner, "match-1".into())).is_err());
     }
 
     #[test]
@@ -1407,6 +1546,48 @@ mod indexeddb_tests {
         IndexedDb::clear().await.unwrap();
     }
 
+    async fn retained_announcement_point_read_is_readonly_in_indexeddb() {
+        IndexedDb::clear().await.unwrap();
+        let owner = reopen().await;
+        let before = stored_record_bytes().await;
+        assert!(owner
+            .read_prepared_enum_announcement("absent".into())
+            .await
+            .unwrap()
+            .is_none());
+        assert!(stored_record_bytes().await == before);
+        for (id, description) in [
+            ("legacy-text", "## Outcome - first - second"),
+            ("markdown-text", "## Outcome\n\n- first\n- second\n"),
+        ] {
+            let prepared = owner
+                .prepare_enum_event(
+                    id.into(),
+                    vec!["YES".into(), "NO".into()],
+                    1,
+                    "Title".into(),
+                    description.into(),
+                )
+                .await
+                .unwrap();
+            let before = stored_record_bytes().await;
+            let retained = owner
+                .read_prepared_enum_announcement(id.into())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(retained.artifact_hex(), prepared.artifact_hex());
+            assert_eq!(retained.nostr_event_json(), prepared.nostr_event_json());
+            let event = Event::from_json(retained.nostr_event_json()).unwrap();
+            assert!(event
+                .tags
+                .iter()
+                .any(|tag| tag.as_slice() == ["description", description]));
+            assert!(stored_record_bytes().await == before);
+        }
+        IndexedDb::clear().await.unwrap();
+    }
+
     async fn compact_maximum_authority_round_trips_indexeddb() {
         use kormir::bitcoin::hashes::{sha256, Hash, HashEngine};
         IndexedDb::clear().await.unwrap();
@@ -1541,6 +1722,7 @@ mod indexeddb_tests {
 
     #[wasm_bindgen_test]
     async fn private_authority_real_indexeddb_restart_race_and_exact_handoff() {
+        retained_announcement_point_read_is_readonly_in_indexeddb().await;
         compact_maximum_authority_round_trips_indexeddb().await;
         missing_key_install_refuses_retained_records().await;
         signing_key_install_preserves_retained_authority().await;
