@@ -1174,8 +1174,8 @@ mod tests {
             .unwrap();
         let parent = EventBuilder::new(Kind::Custom(88), BASE64.encode(ann.encode()))
             .tags([
-                Tag::parse(["title", &format!("x{}", "\u{0001}".repeat(199))]).unwrap(),
-                Tag::parse(["description", &format!("x{}", "\u{0001}".repeat(1999))]).unwrap(),
+                Tag::parse(["title", &"\u{0001}".repeat(200)]).unwrap(),
+                Tag::parse(["description", &"\u{0001}".repeat(2000)]).unwrap(),
             ])
             .sign_with_keys(&owner.nostr_keys())
             .unwrap();
@@ -1203,11 +1203,7 @@ mod tests {
         dto.publication_record_json = Some(publication(
             &dto,
             &summary,
-            Some(explanation(
-                &owner,
-                &dto,
-                format!("x{}", "\u{0001}".repeat(4095)),
-            )),
+            Some(explanation(&owner, &dto, "\u{0001}".repeat(4096))),
             false,
         ));
         assert!(serde_json::to_vec(&dto).unwrap().len() > MAX_PRIVATE_AUTHORITY_BYTES);

@@ -1418,8 +1418,8 @@ mod indexeddb_tests {
                 event_id.clone(),
                 outcomes.clone(),
                 1,
-                format!("x{}", "\u{0001}".repeat(199)),
-                format!("x{}", "\u{0001}".repeat(1999)),
+                "\u{0001}".repeat(200),
+                "\u{0001}".repeat(2000),
             )
             .await
             .unwrap();
@@ -1450,20 +1450,19 @@ mod indexeddb_tests {
         let condition = sha256::Hash::from_engine(hash).to_string();
         let parent = Event::from_json(prepared.nostr_event_json()).unwrap();
         let child = Event::from_json(attestation.nostr_event_json()).unwrap();
-        let explanation =
-            EventBuilder::new(Kind::Custom(1111), format!("x{}", "\u{0001}".repeat(4095)))
-                .allow_self_tagging()
-                .tags([
-                    Tag::parse(["E", &parent.id.to_hex(), "", &key]).unwrap(),
-                    Tag::parse(["K", "88"]).unwrap(),
-                    Tag::parse(["P", &key]).unwrap(),
-                    Tag::parse(["e", &child.id.to_hex(), "", &key]).unwrap(),
-                    Tag::parse(["k", "89"]).unwrap(),
-                    Tag::parse(["p", &key]).unwrap(),
-                ])
-                .sign_with_keys(&owner.oracle.nostr_keys())
-                .unwrap()
-                .as_json();
+        let explanation = EventBuilder::new(Kind::Custom(1111), "\u{0001}".repeat(4096))
+            .allow_self_tagging()
+            .tags([
+                Tag::parse(["E", &parent.id.to_hex(), "", &key]).unwrap(),
+                Tag::parse(["K", "88"]).unwrap(),
+                Tag::parse(["P", &key]).unwrap(),
+                Tag::parse(["e", &child.id.to_hex(), "", &key]).unwrap(),
+                Tag::parse(["k", "89"]).unwrap(),
+                Tag::parse(["p", &key]).unwrap(),
+            ])
+            .sign_with_keys(&owner.oracle.nostr_keys())
+            .unwrap()
+            .as_json();
         let publication = serde_json::json!({
             "binding":{"conditionId":condition,"oracleEventId":event_id,"oraclePubkey":key,"outcomes":outcomes,"announcementEventJson":prepared.nostr_event_json()},
             "chosenOutcome":outcomes[0],"attestation":{"attestationHex":attestation.artifact_hex(),"eventJson":attestation.nostr_event_json()},
